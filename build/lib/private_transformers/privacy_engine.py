@@ -47,25 +47,23 @@ class PrivacyEngine(object):
 
     def __init__(
         self,
-        module,
+        module: nn.Module,
         *,
         batch_size: int,
         sample_size: int,
         max_grad_norm: float,
-        distributed,
-        rank: int=0,
         epochs: Optional[Union[int, float]] = None,
         noise_multiplier: Optional[float] = None,
+        target_epsilon: Optional[float] = None,
         target_delta: Optional[float] = None,
         alphas: Sequence[float] = accounting_manager.DEFAULT_ALPHAS,
         record_snr: bool = True,
         named_params: Optional[Sequence] = None,
-        numerical_stability_constant=1e-4,
+        numerical_stability_constant=1e-6,
         clipping_mode=ClippingMode.default,
+        accounting_mode="rdp",
         eps_error=0.05,
         skip_checks=False,
-        exlude_layer=None,
-        scaler = None,
         **unused_kwargs,
     ):
         """Initialize the engine.
@@ -79,6 +77,8 @@ class PrivacyEngine(object):
             max_grad_norm: The maximum 2-norm for gradient clipping.
             epochs: The number of epochs for training.
             noise_multiplier: The extra multiplier for DP-SGD noise.
+            target_epsilon: The target privacy spending.
+                Only used to estimate the `noise_multiplier` if it is not set.
             target_delta: The target failure probability.
                 Defaults to sample_size ** -1.1 if not set.
             alphas: The RDP orders for (ε, δ)-DP conversion. Useless if not accounting in RDP.
@@ -88,7 +88,7 @@ class PrivacyEngine(object):
                 defaults to use parameters which require grad in module.
             numerical_stability_constant: Small constant to avoid division by 0 when clipping.
             clipping_mode: The clipping mode to use. One of 'default', 'ghost', 'per_layer', 'per_layer_percentile'.
-            accounting_mode: The method of accounting privacy. One of (`rdp`, `all`).
+            accounting_mode: The method of accounting privacy. One of (`rdp`, `glw`, `all`).
                 Meanings of shorthands:
                     - rdp: Account loss with RDP but perform conversion to approx-DP with a procedure defined in
                         "The Discrete Gaussian for Differential Privacy". https://arxiv.org/abs/2004.00010
@@ -101,43 +101,48 @@ class PrivacyEngine(object):
         utils.handle_unused_kwargs(unused_kwargs)
         del unused_kwargs
         super(PrivacyEngine, self).__init__()
-        print(f"initializing privacy engine on rank{rank}")
+
         if clipping_mode not in ClippingMode.all():
             raise ValueError(f"Unknown clipping mode {clipping_mode}. Expected one of {ClippingMode.all()}.")
+        if accounting_mode not in AccountingMode.all():
+            raise ValueError(f"Unknown accounting mode: {accounting_mode}. Expected one of {AccountingMode.all()}.")
         if epochs <= 0.0:
             raise ValueError(f"Number of training epochs cannot be non-positive, but found epochs={epochs}")
 
         # Privacy parameters.
         sample_rate = batch_size / sample_size
         if target_delta is None:
-            target_delta = sample_size ** -1
+            target_delta = sample_size ** -1.1
         if noise_multiplier is None:
-            raise ValueError(
-                f"``noise_multiplier` must be specified."
+            if target_epsilon is None or epochs is None:
+                raise ValueError(
+                    f"`target_epsilon` and `epochs` must be specified when `noise_multiplier` is `None`."
+                )
+            if accounting_mode in ("rdp", "all"):
+                manager = accounting_manager.RDPManager(alphas=alphas)
+            else:  # "glw"
+                manager = accounting_manager.GLWManager(eps_error=eps_error)
+            noise_multiplier = manager.compute_sigma(
+                target_epsilon=target_epsilon, target_delta=target_delta, sample_rate=sample_rate, epochs=epochs,
             )
-            manager = accounting_manager.RDPManager(alphas=alphas) #RDP
-
 
         self.batch_size = batch_size
         self.sample_size = sample_size
         self.sample_rate = sample_rate
         self.max_grad_norm = max_grad_norm
-        self.rank=rank
 
         self.epochs = epochs
         self.noise_multiplier = noise_multiplier
         self.effective_noise_multiplier = noise_multiplier / batch_size
+        self.target_epsilon = target_epsilon
         self.target_delta = target_delta
         self.alphas = alphas
         self.eps_error = eps_error
+        self.accounting_mode = accounting_mode
         self.record_snr = record_snr
 
         # Internals.
         self.steps = 0  # Tracks privacy spending.
-
-        #amp
-        self.scaler = scaler
-        self.nb_nans = 0
 
         # Recording.
         self.max_clip = None
@@ -149,16 +154,10 @@ class PrivacyEngine(object):
         self.noise_limit = None
 
         # Record parameters.
-        self.distributed = distributed
-        if not distributed:
-            self.DDP_module=None
-            self.module = module
-        else:
-            self.DDP_module=module
-            self.module = module.module
+        self.module = module
         if named_params is None:
             self.named_params = tuple(
-                (name, param) for (name, param) in self.module.named_parameters() if param.requires_grad
+                (name, param) for (name, param) in module.named_parameters() if param.requires_grad
             )
         else:
             self.named_params = named_params
@@ -172,12 +171,12 @@ class PrivacyEngine(object):
         else:
             autograd_grad_sample.set_hooks_mode(BackwardHookMode.default)  # Extra guard.
 
-        if not isinstance(self.module, SUPPORTED_TRANSFORMERS) and not skip_checks:
+        if not isinstance(module, SUPPORTED_TRANSFORMERS) and not skip_checks:
             raise ValueError(
-                f"Model type {type(module.module)} is not supported. Please file an issue if you want this model to be added.\n"
+                f"Model type {type(module)} is not supported. Please file an issue if you want this model to be added.\n"
                 f"Currently supported transformers are: {SUPPORTED_TRANSFORMERS}"
             )
-        transformers_support.forward_swapper(module=self.module)  # Fix the position embeddings broadcast issue.
+        transformers_support.forward_swapper(module=module)  # Fix the position embeddings broadcast issue.
 
     def lock(self):
         """Run this after noisy clipped gradient is created to prevent tampering with it before parameter update."""
@@ -198,15 +197,9 @@ class PrivacyEngine(object):
         # Override step.
         def dp_step(_self, **kwargs):
             closure = kwargs.pop("closure", None)
+
             _self.privacy_engine.step(**kwargs)
-            if self.distributed:
-                from opacus.distributed import average_gradients
-                average_gradients(self.module)
-            if _self.privacy_engine.scaler:
-                _self.privacy_engine.scaler.step(optimizer)
-                _self.privacy_engine.scaler.update()
-            else:
-                _self.original_step(closure=closure)
+            _self.original_step(closure=closure)
             _self.privacy_engine.unlock()  # Only enable creating new grads once parameters are updated.
             _self.privacy_engine.steps += 1
 
@@ -222,7 +215,7 @@ class PrivacyEngine(object):
         optimizer.privacy_engine = self
 
         optimizer.original_step = optimizer.step
-        optimizer.dp_step = types.MethodType(dp_step, optimizer)
+        optimizer.step = types.MethodType(dp_step, optimizer)
 
         optimizer.original_zero_grad = optimizer.zero_grad
         optimizer.zero_grad = types.MethodType(dp_zero_grad, optimizer)
@@ -264,8 +257,10 @@ class PrivacyEngine(object):
     def step(
         self,
         loss: torch.Tensor,
+        scale=1.,
         # Function that takes in named_params and does something.
         # This option was included to help with another spectrum analysis project.
+        callback: Optional[Callable] = None,
     ):
         if loss.dim() != 1:
             raise ValueError(
@@ -273,17 +268,21 @@ class PrivacyEngine(object):
             )
 
         if self.clipping_mode == ClippingMode.ghost:
+            if callback is not None:
+                raise ValueError("Ghost clipping does not support `callback` in `optimizer.step`.")
+            if scale != 1.:
+                raise ValueError("Ghost clipping does not support mixed-precision training.")
             self._ghost_step(loss=loss)
         else:
-            self._step(loss=loss, callback=callback)
+            self._step(loss=loss, scale=scale, callback=callback)
 
     @torch.no_grad()
-    def virtual_step(self, loss: torch.Tensor):
+    def virtual_step(self, loss: torch.Tensor, scale=1.):
         """Virtual step function when there's gradient accumulation."""
         if self.clipping_mode == ClippingMode.ghost:
             self._ghost_virtual_step(loss=loss)
         else:
-            self._virtual_step(loss=loss)
+            self._virtual_step(loss=loss, scale=scale)
 
     def zero_grad(self, skip_grad=False):
         for name, param in self.named_params:
@@ -297,7 +296,7 @@ class PrivacyEngine(object):
                 if hasattr(param, "grad"):
                     del param.grad
 
-    def _create_noisy_clipped_gradient(self, upgrade=True):
+    def _create_noisy_clipped_gradient(self):
         """Create noisy clipped gradient for `optimizer.step`.
 
         Add noise and scale by inverse batch size.
@@ -319,11 +318,11 @@ class PrivacyEngine(object):
 
             if self.record_snr:
                 signals.append(param.grad.reshape(-1).norm(2))
-            if self.noise_multiplier > 0 and self.max_grad_norm > 0 and self.rank==0 and upgrade:
-                scale = self.scaler.get_scale() if self.scaler else 1
+
+            if self.noise_multiplier > 0 and self.max_grad_norm > 0:
                 noise = torch.normal(
                     mean=0,
-                    std=self.noise_multiplier * self.max_grad_norm *scale,
+                    std=self.noise_multiplier * self.max_grad_norm,
                     size=param.size(),
                     device=param.device,
                     dtype=param.dtype,
@@ -332,6 +331,7 @@ class PrivacyEngine(object):
                 if self.record_snr:
                     noises.append(noise.reshape(-1).norm(2))
                 del noise
+
             param.grad /= self.batch_size
 
         if self.record_snr and len(noises) > 0:
@@ -379,10 +379,7 @@ class PrivacyEngine(object):
     def _double_backward(self, loss: torch.Tensor):
         """Given per-example losses, backward twice to accumulate summed clipped gradients in `.grad`."""
         first_loss = loss.sum()
-        if self.scaler:
-            self.scaler.scale(first_loss).backward(retain_graph=True)
-        else:
-            first_loss.backward(retain_graph=True)
+        first_loss.backward(retain_graph=True)
 
         # Prepare for second backward.
         autograd_grad_sample.set_hooks_mode(BackwardHookMode.ghost_grad)
@@ -395,11 +392,7 @@ class PrivacyEngine(object):
 
         coef_sample = self.get_coef_sample()
         second_loss = (coef_sample * loss).sum(dim=0)
-        
-        if self.scaler:
-            self.scaler.scale(second_loss).backward()
-        else:
-            second_loss.backward()
+        second_loss.backward()
 
         # Prepare for first backward (in the next round).
         autograd_grad_sample.set_hooks_mode(BackwardHookMode.ghost_norm)
@@ -407,37 +400,18 @@ class PrivacyEngine(object):
     def get_coef_sample(self) -> torch.Tensor:
         """Get per-example gradient scaling factor for clipping."""
         norm_sample = self.get_norm_sample()
-        scale = self.scaler.get_scale() if self.scaler else 1
-        aux = torch.clamp_max(self.max_grad_norm * scale / (norm_sample + self.numerical_stability_constant), 1.)
-        torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
-        nans = aux.isnan().float().sum()
-        if nans >0:
-            self.nb_nans +=nans
-            print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
-            torch.nan_to_num(aux, nan=0)
-        return aux
+        return torch.clamp_max(self.max_grad_norm / (norm_sample + self.numerical_stability_constant), 1.)
 
     def get_norm_sample(self) -> torch.Tensor:
         """Get per-example gradient norms."""
-        if self.scaler:
-            aux = torch.stack([param.norm_sample for name, param in self.named_params], dim=0)
-            nans = aux.isnan().float().mean()
-            infs=aux.isinf().float().mean()
-            if infs>0:
-                print(f"there were some inf values in per layer norm computation: {infs}. Switching them to NaNs")
-                aux = torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
-                assert aux.isinf().float().mean()==0
-            if infs + nans >0:
-                print(f"proportion of NaNs: {aux.isnan().float().mean()}")
-            norm_sample = aux.norm(2, dim=0)
-        else:
-            norm_sample = torch.stack([param.norm_sample for name, param in self.named_params], dim=0).norm(2, dim=0)
+        norm_sample = torch.stack([param.norm_sample for name, param in self.named_params], dim=0).norm(2, dim=0)
         return norm_sample
 
     # --- default clipping ---
     def _step(
         self,
         loss,
+        scale,
         callback,
     ):
         """Create noisy gradients.
@@ -452,12 +426,13 @@ class PrivacyEngine(object):
 
         Args:
             loss: The per-example loss; a 1-D tensor.
+            scale: The loss up-scaling factor in amp. In full precision, this arg isn't useful.
         """
         if self._locked:  # Skip this gradient creation step if already created gradient and haven't stepped.
             logging.warning("Attempted to step, but the engine is on lock.")
             return
 
-        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss)
+        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss, scale=scale)
         # Collect stats for debugging.
         self.max_clip = coef_sample.max().item()
         self.min_clip = coef_sample.min().item()
@@ -465,13 +440,13 @@ class PrivacyEngine(object):
 
         if callback is not None:
             callback(self)
-        self._create_noisy_clipped_gradient(upgrade=True)
+        self._create_noisy_clipped_gradient()
 
-    def _virtual_step(self, loss):
-        self._accumulate_summed_grad(loss=loss)
+    def _virtual_step(self, loss, scale):
+        self._accumulate_summed_grad(loss=loss, scale=scale)
 
     @torch.no_grad()
-    def _accumulate_summed_grad(self, loss):
+    def _accumulate_summed_grad(self, loss, scale):
         """Accumulate signal by summing clipped gradients.
 
         Removes `.grad_sample` and `.grad` for each variable that requires grad at the end.
@@ -516,7 +491,7 @@ class PrivacyEngine(object):
             raise runtime_error
 
         coef_sample = torch.clamp_max(
-            self.max_grad_norm / (norm_sample + self.numerical_stability_constant), 1.
+            self.max_grad_norm * scale / (norm_sample + self.numerical_stability_constant), 1.
         )
         for name, param in self.named_params:
             if not hasattr(param, 'summed_grad'):
@@ -537,26 +512,48 @@ class PrivacyEngine(object):
     def get_privacy_spent(
         self,
         steps: Optional[int] = None,
+        accounting_mode: Optional[str] = None,
         lenient=False
     ) -> Dict:
         if steps is None:
             steps = self.steps
+        if accounting_mode is None:
+            accounting_mode = self.accounting_mode
 
         privacy_results = {}  # Contains stats from all modes.
-        try:
-            manager = accounting_manager.RDPManager(alphas=self.alphas)
-            privacy_results.update(
-                manager.compute_epsilon(
-                    sigma=self.noise_multiplier,
-                    sample_rate=self.sample_rate,
-                    target_delta=self.target_delta,
-                    steps=steps,
+        if accounting_mode in (AccountingMode.all_, AccountingMode.rdp):
+            try:
+                manager = accounting_manager.RDPManager(alphas=self.alphas)
+                privacy_results.update(
+                    manager.compute_epsilon(
+                        sigma=self.noise_multiplier,
+                        sample_rate=self.sample_rate,
+                        target_delta=self.target_delta,
+                        steps=steps,
+                    )
                 )
-            )
-        except Exception as err:
-            logging.fatal("RDP accounting failed! Double check privacy parameters.")
-            if not lenient:
-                raise err
+            except Exception as err:
+                logging.fatal("RDP accounting failed! Double check privacy parameters.")
+                if not lenient:
+                    raise err
+
+        if accounting_mode in (AccountingMode.all_, AccountingMode.glw):
+            try:
+                manager = accounting_manager.GLWManager(eps_error=self.eps_error)
+                privacy_results.update(
+                    manager.compute_epsilon(
+                        sigma=self.noise_multiplier,
+                        sample_rate=self.sample_rate,
+                        target_delta=self.target_delta,
+                        steps=steps
+                    )
+                )
+            except Exception as err:
+                logging.fatal(
+                    "Numerical composition of tradeoff functions failed! Double check privacy parameters."
+                )
+                if not lenient:
+                    raise err
 
         return privacy_results
 
@@ -575,6 +572,7 @@ class PrivacyEngine(object):
     def __repr__(self):
         return (
             f"PrivacyEngine(\n"
+            f"  target_epsilon={self.target_epsilon:.6f}, \n"
             f"  target_delta={self.target_delta:.6f}, \n"
             f"  noise_multiplier={self.noise_multiplier:.6f}, \n"
             f"  effective_noise_multiplier={self.effective_noise_multiplier:.6f}, \n"
@@ -582,8 +580,7 @@ class PrivacyEngine(object):
             f"  max_grad_norm={self.max_grad_norm}, \n"
             f"  sample_rate={self.sample_rate}, \n"
             f"  batch_size={self.batch_size}, \n"
+            f"  accounting_mode={self.accounting_mode}, \n"
             f"  clipping_mode={self.clipping_mode}\n"
             f")"
         )
-
-

@@ -1,0 +1,10 @@
+torch>=1.8.0
+prv-accountant
+transformers>=4.20.1
+numpy
+scipy
+jupyterlab
+jupyter
+ml-swissknife
+opt_einsum
+pytest

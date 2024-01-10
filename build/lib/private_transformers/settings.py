@@ -33,10 +33,7 @@ class AccountingMode(metaclass=utils.ContainerMeta):
     rdp = "rdp"
     glw = "glw"
     all_ = "all"
-import sys
-sys.path.insert(0, '../')
-import models_mae
-#import models_mae_img2text
+
 SUPPORTED_TRANSFORMERS = (
     transformers.models.openai.modeling_openai.OpenAIGPTLMHeadModel,
     transformers.models.openai.modeling_openai.OpenAIGPTDoubleHeadsModel,
@@ -51,6 +48,4 @@ SUPPORTED_TRANSFORMERS = (
     transformers.models.vit.modeling_vit.ViTForImageClassification,
     transformers.models.deit.modeling_deit.DeiTForImageClassification,
     transformers.models.beit.modeling_beit.BeitForImageClassification,
-    models_mae.MaskedAutoencoderViT_autoregressive,
-    #models_mae_img2text.MaskedAutoencoderViT_autoregressive,
 )

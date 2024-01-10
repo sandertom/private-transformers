@@ -42,7 +42,6 @@ from .settings import BackwardHookMode
 
 
 def sum_over_all_but_batch_and_last_n(tensor: torch.Tensor, n_dims: int) -> torch.Tensor:
-    tensor = tensor.to(torch.float32)
     if tensor.dim() == n_dims + 1:
         return tensor
     else:
@@ -51,8 +50,6 @@ def sum_over_all_but_batch_and_last_n(tensor: torch.Tensor, n_dims: int) -> torc
 
 
 def _light_linear_weight_norm_sample(A, B) -> torch.Tensor:
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
     """Compute gradient sample norm for the weight matrix in a linear layer."""
     if A.dim() == 2 and B.dim() == 2:
         return _light_linear_weight_norm_sample_non_sequential(A, B)
@@ -69,8 +66,6 @@ def _light_linear_weight_norm_sample_sequential(A, B):
     """
     # TODO: This saves compute based on online dimension estimates. Downside is that it makes JIT impossible.
     #  Think harder about better solutions.
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
     (b, t, p), (_, _, d) = A.size(), B.size()
     if 2 * t ** 2 < p * d:
         return torch.sqrt((torch.bmm(A, A.transpose(-1, -2)) * torch.bmm(B, B.transpose(-1, -2))).sum(dim=(1, 2)))
@@ -80,13 +75,10 @@ def _light_linear_weight_norm_sample_sequential(A, B):
 
 def _light_linear_weight_norm_sample_non_sequential(A, B):
     """The Goodfellow trick, i.e., Frobenius norm equal to product of 2-norms."""
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
     return A.norm(2, dim=1) * B.norm(2, dim=1)
 
 
 def _light_linear_bias_norm_sample(B):
-    B = B.to(torch.float32)
     if B.dim() == 2:
         return B.norm(2, dim=1)
     elif B.dim() == 3:
@@ -96,7 +88,6 @@ def _light_linear_bias_norm_sample(B):
 
 
 def _create_or_extend_grad_sample(param: torch.Tensor, grad_sample: torch.Tensor) -> None:
-    
     """Creates a ``grad_sample`` attribute in the given parameter or accumulate the existing tensor."""
     if hasattr(param, "requires_grad") and not param.requires_grad:
         return
@@ -107,9 +98,9 @@ def _create_or_extend_grad_sample(param: torch.Tensor, grad_sample: torch.Tensor
 
     # Warning: When a parameter with `grad_sample` is reused, the per-sample gradients are accumulated.
     if hasattr(param, "grad_sample"):
-        param.grad_sample += grad_sample.detach().to(torch.float32)
+        param.grad_sample += grad_sample.detach()
     else:
-        param.grad_sample = grad_sample.detach().to(torch.float32)
+        param.grad_sample = grad_sample.detach()
 
 
 def _create_or_extend_norm_sample(param: torch.Tensor, norm_sample: torch.Tensor) -> None:
@@ -136,14 +127,12 @@ def _compute_linear_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tup
     This function is written in an unusually bespoke way to avoid using `torch.einsum`.
     """
     (A,), (B,) = A, B  # Unpack singleton tuples.
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(A, B))
+        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(A, B))
 
         if layer.bias is not None:
-            _create_or_extend_norm_sample(layer.bias.to(torch.float32), _light_linear_bias_norm_sample(B))
+            _create_or_extend_norm_sample(layer.bias, _light_linear_bias_norm_sample(B))
     else:
         if B.dim() == 3 and A.dim() == 3:
             grad_weight = torch.bmm(B.permute(0, 2, 1), A)
@@ -156,44 +145,40 @@ def _compute_linear_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tup
                 f"Expected both grad_output and input to have dimension 2 or 3, "
                 f"but found len(grad_output.dim())={len(B.dim())}, len(input.dim())={len(A.dim())}"
             )
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_weight.to(torch.float32))
+        _create_or_extend_grad_sample(layer.weight, grad_weight)
 
         if layer.bias is not None:
-            _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_bias.to(torch.float32))
+            _create_or_extend_grad_sample(layer.bias, grad_bias)
 
 
 def _compute_layer_norm_grad_sample(layer: nn.LayerNorm, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]) -> None:
     """Computes per sample gradients for `nn.LayerNorm` layer."""
     (A,), (B,) = A, B  # Unpack singleton tuples.
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     is_backward_ghost_norm = autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm
 
     grad_sample = sum_over_all_but_batch_and_last_n(
-        F.layer_norm(A, layer.normalized_shape, eps=layer.eps*10) * B,#try*10 eps
+        F.layer_norm(A, layer.normalized_shape, eps=layer.eps) * B,
         layer.weight.dim(),
     )
     if is_backward_ghost_norm:
         norm_sample = grad_sample.flatten(start_dim=1).norm(2, dim=1)
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+        _create_or_extend_norm_sample(layer.weight, norm_sample)
     else:
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample)
+        _create_or_extend_grad_sample(layer.weight, grad_sample)
 
-    grad_sample = sum_over_all_but_batch_and_last_n(B, layer.bias.dim()).to(torch.float32)
+    grad_sample = sum_over_all_but_batch_and_last_n(B, layer.bias.dim())
     if is_backward_ghost_norm:
         norm_sample = grad_sample.flatten(start_dim=1).norm(2, dim=1)
-        _create_or_extend_norm_sample(layer.bias.to(torch.float32), norm_sample)
+        _create_or_extend_norm_sample(layer.bias, norm_sample)
     else:
-        _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_sample)
+        _create_or_extend_grad_sample(layer.bias, grad_sample)
 
 
 def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]) -> None:
     """Computes per sample gradients for `nn.Embedding` layer."""
     # `nn.Embedding` has single input and output. Unpack singleton tuples.
     (A,), (B,) = A, B
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
         not_AAt: torch.Tensor = ~A[:, :, None].eq(A[:, None, :])
@@ -207,7 +192,7 @@ def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor], 
             #   So the entry gets cleared whenever one of A, A^t takes the padding idx.
             not_AAt.bitwise_or_((A[:, :, None] == padding_idx) | (A[:, None, :] == padding_idx))
         norm_sample = torch.sqrt((torch.bmm(B, B.transpose(-1, -2)).masked_fill(not_AAt, 0)).sum(dim=(1, 2)))
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+        _create_or_extend_norm_sample(layer.weight, norm_sample)
     else:
         A_dense = F.one_hot(A, num_classes=layer.weight.shape[0]).to(B)  # (batch_size, seq_len, vocab_dim,)
         grad_sample = torch.bmm(A_dense.permute(0, 2, 1), B)
@@ -216,7 +201,7 @@ def _compute_embedding_grad_sample(layer: nn.Embedding, A: Tuple[torch.Tensor], 
         if layer.padding_idx is not None:
             # `grad_sample` has size (batch_size, num_vocab, embedding_dim).
             grad_sample[:, layer.padding_idx, :] = 0.
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample)
+        _create_or_extend_grad_sample(layer.weight, grad_sample)
 
 
 def _custom_compute_conv1d_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]):
@@ -224,27 +209,23 @@ def _custom_compute_conv1d_grad_sample(layer: nn.Linear, A: Tuple[torch.Tensor],
     # `transformers.modeling_utils.Conv1D` has single input and output. Unpack singleton tuples.
     # https://github.com/huggingface/transformers/blob/ccc089780415445768bcfd3ac4418cec20353484/src/transformers/pytorch_utils.py#L107
     (A,), (B,) = A, B
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(A, B))
+        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(A, B))
 
         if layer.bias is not None:
-            _create_or_extend_norm_sample(layer.bias.to(torch.float32), B.sum(dim=1).norm(2, dim=1))
+            _create_or_extend_norm_sample(layer.bias, B.sum(dim=1).norm(2, dim=1))
     else:
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), torch.bmm(A.permute(0, 2, 1), B))
+        _create_or_extend_grad_sample(layer.weight, torch.bmm(A.permute(0, 2, 1), B))
 
         if layer.bias is not None:
-            _create_or_extend_grad_sample(layer.bias.to(torch.float32), B.sum(dim=1))
+            _create_or_extend_grad_sample(layer.bias, B.sum(dim=1))
 
 
 def _compute_t5_layer_norm_grad_sample(layer: T5LayerNorm, A: Tuple[torch.Tensor], B: Tuple[torch.Tensor]):
     # `transformers.models.t5.modeling_t5.T5LayerNorm` has single input and output. Unpack singleton tuples.
     # https://github.com/huggingface/transformers/blob/ccc089780415445768bcfd3ac4418cec20353484/src/transformers/models/t5/modeling_t5.py#L248
     (A,), (B,) = A, B
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     assert A.dim() == 3 and B.dim() == 3, (
         "Internal error: T5LayerNorm receiving 2-D tensors, but expected 3-D tensors (sequential inputs)."
@@ -254,10 +235,10 @@ def _compute_t5_layer_norm_grad_sample(layer: T5LayerNorm, A: Tuple[torch.Tensor
 
     grad_sample = (A * torch.rsqrt(A.pow(2).mean(-1, keepdim=True) + layer.variance_epsilon) * B).sum(dim=1)
     if is_backward_ghost_norm:
-        norm_sample = grad_sample.to(torch.float32).norm(2, dim=1)
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), norm_sample)
+        norm_sample = grad_sample.norm(2, dim=1)
+        _create_or_extend_norm_sample(layer.weight, norm_sample)
     else:
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_sample.to(torch.float32))
+        _create_or_extend_grad_sample(layer.weight, grad_sample)
 
 
 def _compute_opt_learned_positional_embedding_grad_sample(
@@ -266,8 +247,6 @@ def _compute_opt_learned_positional_embedding_grad_sample(
     # `transformers.models.opt.modeling_opt.OPTLearnedPositionalEmbedding` has two inputs and one output.
     # https://github.com/huggingface/transformers/blob/d0acc9537829e7d067edbb791473bbceb2ecf056/src/transformers/models/opt/modeling_opt.py#L99
     (A, past_key_values_length), (B,) = A, B  # Unpack tuples.
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
 
     attention_mask = A.long()
 
@@ -295,7 +274,7 @@ def unfold2d(
     H_effective = (H + 2 * padding[0] - (kernel_size[0] + (kernel_size[0] - 1) * (dilation[0] - 1))) // stride[0] + 1
     W_effective = (W + 2 * padding[1] - (kernel_size[1] + (kernel_size[1] - 1) * (dilation[1] - 1))) // stride[1] + 1
     # F.pad's first argument is the padding of the *last* dimension
-    input = F.pad(input.to(torch.float32), (padding[1], padding[1], padding[0], padding[0]))
+    input = F.pad(input, (padding[1], padding[1], padding[0], padding[0]))
     *shape_pad, H_pad, W_pad = input.shape
     strides = list(input.stride())
     strides = strides[:-2] + [
@@ -306,7 +285,7 @@ def unfold2d(
     ]
     out = input.as_strided(
         shape + [kernel_size[0], kernel_size[1], H_effective, W_effective], strides
-    ).to(torch.float32)
+    )
 
     return out.reshape(input.size(0), -1, H_effective * W_effective)
 
@@ -314,8 +293,6 @@ def unfold2d(
 def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tensor], backprops: Tuple[torch.Tensor]):
     # `nn.Conv2d` has one input and one output. Unpack tuples.
     (activations,), (backprops,) = activations, backprops
-    activations = activations.to(torch.float32)
-    backprops = backprops.to(torch.float32)
 
     n = activations.shape[0]
     activations = unfold2d(
@@ -326,9 +303,9 @@ def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tenso
     if autograd_grad_sample.get_hooks_mode() == BackwardHookMode.ghost_norm:
         activations = activations.permute(0, 2, 1)
         backprops = backprops.permute(0, 2, 1)
-        _create_or_extend_norm_sample(layer.weight.to(torch.float32), _light_linear_weight_norm_sample(activations, backprops))
+        _create_or_extend_norm_sample(layer.weight, _light_linear_weight_norm_sample(activations, backprops))
         if layer.bias is not None:
-            _create_or_extend_norm_sample(layer.bias.to(torch.float32), _light_linear_bias_norm_sample(backprops))
+            _create_or_extend_norm_sample(layer.bias, _light_linear_bias_norm_sample(backprops))
     else:
         # n=batch_sz; o=num_out_channels; p=(num_in_channels/groups)*kernel_sz
         grad_sample = contract("noq,npq->nop", backprops, activations)
@@ -343,11 +320,11 @@ def _compute_conv2d_grad_sample(layer: nn.Conv2d, activations: Tuple[torch.Tenso
         )
         grad_sample = contract("ngrg...->ngr...", grad_sample).contiguous()
         grad_weight = grad_sample.view([n] + list(layer.weight.shape))
-        _create_or_extend_grad_sample(layer.weight.to(torch.float32), grad_weight.to(torch.float32))
+        _create_or_extend_grad_sample(layer.weight, grad_weight)
 
         if layer.bias is not None:
             grad_bias = torch.sum(backprops, dim=2)
-            _create_or_extend_grad_sample(layer.bias.to(torch.float32), grad_bias.to(torch.float32))
+            _create_or_extend_grad_sample(layer.bias, grad_bias)
 
 
 _supported_layers_grad_samplers = {
