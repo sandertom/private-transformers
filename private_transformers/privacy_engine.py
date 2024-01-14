@@ -50,10 +50,10 @@ class PrivacyEngine(object):
         module,
         *,
         batch_size: int,
-        sample_size: int,
         max_grad_norm: float,
         distributed,
         rank: int=0,
+        sample_size: int =1000000,
         epochs: Optional[Union[int, float]] = None,
         noise_multiplier: Optional[float] = None,
         target_delta: Optional[float] = None,
@@ -98,6 +98,8 @@ class PrivacyEngine(object):
             eps_error: Error threshold for upper and lower bound in the GLW accounting procedure.
             skip_checks: Skips the model type validation test if True.
         """
+        if sample_size == 1000000:
+            print("sample_size if set to 1000000 by default, because we do not use the accounting from the private-transformers library. This value is not used.")
         utils.handle_unused_kwargs(unused_kwargs)
         del unused_kwargs
         super(PrivacyEngine, self).__init__()
