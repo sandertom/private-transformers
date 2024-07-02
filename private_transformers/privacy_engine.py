@@ -416,7 +416,7 @@ class PrivacyEngine(object):
         if nans >0:
             self.nb_nans +=nans
             print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
-            torch.nan_to_num(aux, nan=0)
+            aux = torch.nan_to_num(aux, nan=0)
         return aux
 
     def get_norm_sample(self) -> torch.Tensor:
