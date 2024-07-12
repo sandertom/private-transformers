@@ -411,12 +411,15 @@ class PrivacyEngine(object):
         norm_sample = self.get_norm_sample()
         scale = self.scaler.get_scale() if self.scaler else 1
         aux = torch.clamp_max(self.max_grad_norm * scale / (norm_sample + self.numerical_stability_constant), 1.)
-        torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
+        aux = torch.nan_to_num(aux, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
         nans = aux.isnan().float().sum()
-        if nans >0:
-            self.nb_nans +=nans
-            print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
-            aux = torch.nan_to_num(aux, nan=0)
+        if nans > 0:
+            self.nb_nans += nans
+            print(f"number of nans in per sample norms: {nans}.")
+            # aux = torch.nan_to_num(aux, nan=0)
+            # print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
+            # else:
+                # print(f"number of nans in per sample norms: {nans}. not replacing them to let the grad scaler decrease.")
         return aux
 
     def get_norm_sample(self) -> torch.Tensor:
