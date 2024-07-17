@@ -66,6 +66,7 @@ class PrivacyEngine(object):
         skip_checks=False,
         exlude_layer=None,
         scaler = None,
+        amp_set_nans_to_zero = False,
         **unused_kwargs,
     ):
         """Initialize the engine.
@@ -140,6 +141,7 @@ class PrivacyEngine(object):
         #amp
         self.scaler = scaler
         self.nb_nans = 0
+        self.amp_set_nans_to_zero = amp_set_nans_to_zero
 
         # Recording.
         self.max_clip = None
@@ -416,10 +418,11 @@ class PrivacyEngine(object):
         if nans > 0:
             self.nb_nans += nans
             print(f"number of nans in per sample norms: {nans}.")
-            # aux = torch.nan_to_num(aux, nan=0)
-            # print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
-            # else:
-                # print(f"number of nans in per sample norms: {nans}. not replacing them to let the grad scaler decrease.")
+            if self.amp_set_nans_to_zero:
+                aux = torch.nan_to_num(aux, nan=0)
+                print(f"number of nans in per sample norms: {nans}. Replacing them by 0.")
+            else:
+                print(f"number of nans in per sample norms: {nans}. not replacing them to let the grad scaler decrease.")
         return aux
 
     def get_norm_sample(self) -> torch.Tensor:
